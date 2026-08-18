@@ -71,6 +71,9 @@ class NanoAODSchema(BaseSchema):
         "GenJet": "PtEtaPhiMCollection",
         "GenJetAK8": "PtEtaPhiMCollection",
         "Jet": "Jet",
+        "jet": "PtEtaPhiMCollection", # ADDED THIS
+        "jetOR": "PtEtaPhiMCollection", # ADDED THIS
+        "fatjet": "PtEtaPhiMCollection", # ADDED THIS
         "LHEPart": "PtEtaPhiMCollection",
         "SubGenJetAK8": "PtEtaPhiMCollection",
         "SubJet": "PtEtaPhiMCollection",

@@ -17,6 +17,11 @@ import numpy
 from dask_awkward.lib.core import compatible_partitions
 from dask_awkward.utils import IncompatiblePartitions
 
+try:
+    import cupy
+except ImportError:
+    cupy = None
+
 import coffea.processor
 import coffea.util
 from coffea.util import coffea_console
@@ -252,6 +257,56 @@ class Weights:
         )
         self._names.append(name)
 
+    def __add_eager_cupy(self, name, weight, weightUp, weightDown, shift):
+        """Add a new eager weight that stays on the GPU (cupy-backed).
+
+        Mirrors __add_eager, but cupy has no masked-array type to defer the
+        fill_value decision the way numpy.ma does, so missing values are
+        filled via awkward up front. The running weight product is
+        (re)initialized on the GPU the first time a cuda-backend weight is
+        added.
+        """
+        weight = awkward.to_cupy(awkward.fill_none(weight, 1.0))
+        if len(self._names) == 0:
+            self._weight = cupy.ones(len(weight), dtype=weight.dtype)
+        elif not isinstance(self._weight, cupy.ndarray):
+            raise ValueError(
+                f"New weight '{name}' is on the cuda backend while Weights "
+                "already holds a different backend's data"
+            )
+        self._weight = self._weight * weight
+        if self._storeIndividual:
+            self._weights[name] = weight
+        self.__add_variation(name, weight, weightUp, weightDown, shift)
+        if weight.size == 0:
+            dtype = weight.dtype
+            if dtype in (
+                numpy.int8,
+                numpy.int16,
+                numpy.int32,
+                numpy.int64,
+                numpy.uint8,
+                numpy.uint16,
+                numpy.uint32,
+                numpy.uint64,
+            ):
+                min = numpy.iinfo(dtype).max
+                max = numpy.iinfo(dtype).min
+            else:
+                min = numpy.inf
+                max = -numpy.inf
+        else:
+            min = float(weight.min())
+            max = float(weight.max())
+        self._weightStats[name] = WeightStatistics(
+            float(weight.sum()),
+            float((weight**2).sum()),
+            min,
+            max,
+            int(weight.size),
+        )
+        self._names.append(name)
+
     def __add_delayed(self, name, weight, weightUp, weightDown, shift):
         """Add a new weight with delayed calculation"""
         if isinstance(dask_awkward.type(weight), awkward.types.OptionType):
@@ -305,6 +360,9 @@ class Weights:
             raise ValueError(
                 "Avoid using 'Up' and 'Down' in weight names, instead pass appropriate shifts to add() call"
             )
+        if isinstance(weight, awkward.Array) and awkward.backend(weight) == "cuda":
+            self.__add_eager_cupy(name, weight, weightUp, weightDown, shift)
+            return
         weight = coffea.util._ensure_flat(weight, allow_missing=True)
         if isinstance(weight, numpy.ndarray) and isinstance(
             self._weight, numpy.ndarray
@@ -502,6 +560,23 @@ class Weights:
             )
             self._modifiers[name + "Down"] = weightDown
 
+    def __add_variation_cupy(self, name, weight, weightUp, weightDown, shift):
+        """Helper function to add an eagerly calculated weight variation that stays on the GPU."""
+        if weightUp is not None:
+            weightUp = awkward.to_cupy(awkward.fill_none(weightUp, 1.0))
+            if shift:
+                weightUp = weightUp + weight
+            nonzero = weight != 0.0
+            weightUp[nonzero] = weightUp[nonzero] / weight[nonzero]
+            self._modifiers[name + "Up"] = weightUp
+        if weightDown is not None:
+            weightDown = awkward.to_cupy(awkward.fill_none(weightDown, 1.0))
+            if shift:
+                weightDown = weight - weightDown
+            nonzero = weight != 0.0
+            weightDown[nonzero] = weightDown[nonzero] / weight[nonzero]
+            self._modifiers[name + "Down"] = weightDown
+
     def __add_variation(
         self, name, weight, weightUp=None, weightDown=None, shift=False
     ):
@@ -530,6 +605,8 @@ class Weights:
             self.__add_variation_eager(name, weight, weightUp, weightDown, shift)
         elif isinstance(weight, dask_awkward.Array):
             self.__add_variation_delayed(name, weight, weightUp, weightDown, shift)
+        elif cupy is not None and isinstance(weight, cupy.ndarray):
+            self.__add_variation_cupy(name, weight, weightUp, weightDown, shift)
 
     def weight(self, modifier=None):
         """Returns the current event weight vector
@@ -546,10 +623,18 @@ class Weights:
                 The weight vector, possibly modified by the effect of a given systematic variation.
         """
         if modifier is None:
-            return self._weight
+            result = self._weight
         elif "Down" in modifier and modifier not in self._modifiers:
-            return self._weight / self._modifiers[modifier.replace("Down", "Up")]
-        return self._weight * self._modifiers[modifier]
+            result = self._weight / self._modifiers[modifier.replace("Down", "Up")]
+        else:
+            result = self._weight * self._modifiers[modifier]
+        # Hand back an ak.Array on the cuda backend rather than a raw cupy
+        # array, so it can be indexed/broadcast against the other
+        # cuda-backend ak.Arrays elsewhere in the processor with no
+        # host round-trip.
+        if cupy is not None and isinstance(result, cupy.ndarray):
+            return awkward.from_cupy(result)
+        return result
 
     def partial_weight(self, include=[], exclude=[], modifier=None):
         """Partial event weight vector
@@ -2111,6 +2196,8 @@ class PackedSelection:
             return True
         elif isinstance(self._data, numpy.ndarray):
             return False
+        elif cupy is not None and isinstance(self._data, cupy.ndarray):
+            return False
         else:
             warnings.warn(
                 "PackedSelection hasn't been initialized with a boolean array yet!"
@@ -2187,6 +2274,37 @@ class PackedSelection:
         )
         self._names.append(name)
 
+    def __add_eager_cupy(self, name, selection, fill_value):
+        """Add a new eager boolean array that stays on the GPU (cupy-backed).
+
+        Mirrors __add_eager, but cupy has no masked-array type to defer the
+        fill_value decision the way numpy.ma does, and its ufuncs don't
+        reliably support the `where=` kwarg -- so missing values are filled
+        up front via awkward, and the bit-packing uses a plain OR/multiply
+        instead of `numpy.bitwise_or(..., where=...)`.
+        """
+        if self._data is not None and not isinstance(self._data, cupy.ndarray):
+            raise ValueError(
+                f"New selection '{name}' is on the cuda backend while "
+                "PackedSelection already holds a different backend's data"
+            )
+        selection = awkward.to_cupy(awkward.fill_none(selection, fill_value))
+        if selection.dtype != bool:
+            raise ValueError(f"Expected a boolean array, received {selection.dtype}")
+        if len(self._names) == 0:
+            self._data = cupy.zeros(len(selection), dtype=self._dtype)
+        elif len(self._names) == self.maxitems:
+            raise RuntimeError(
+                f"Exhausted all slots in PackedSelection: {self}, consider a larger dtype or fewer selections"
+            )
+        elif self._data.shape != selection.shape:
+            raise ValueError(
+                f"New selection '{name}' has a different shape than existing selections ({selection.shape} vs. {self._data.shape})"
+            )
+        bit = self._dtype.type(1 << len(self._names))
+        self._data = self._data | (selection.astype(self._dtype) * bit)
+        self._names.append(name)
+
     def add(self, name, selection, fill_value=False):
         """Add a new boolean array
 
@@ -2208,6 +2326,9 @@ class PackedSelection:
             raise ValueError(
                 "Dask arrays are not supported, please convert them to dask_awkward.Array by using dask_awkward.from_dask_array()"
             )
+        if isinstance(selection, awkward.Array) and awkward.backend(selection) == "cuda":
+            self.__add_eager_cupy(name, selection, fill_value)
+            return
         selection = coffea.util._ensure_flat(selection, allow_missing=True)
         if isinstance(selection, numpy.ndarray):
             self.__add_eager(name, selection, fill_value)
